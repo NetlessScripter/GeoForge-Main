@@ -1,0 +1,950 @@
+local svc = setmetatable({}, {
+    __index = function(t, k)
+        local s = game:GetService(k)
+        rawset(t, k, s)
+        return s
+    end
+})
+
+local Players = svc.Players
+local RS = svc.RunService
+local CP = svc.ContentProvider
+local RepStorage = svc.ReplicatedStorage
+local WS = svc.Workspace
+local UIS = svc.UserInputService
+local Stats = svc.Stats
+local Lighting = svc.Lighting
+local CS = svc.CollectionService
+local HttpService = svc.HttpService
+local ContextActionService = svc.ContextActionService
+
+local p = Players.LocalPlayer
+local m = p:GetMouse()
+
+local cfg = {
+    RENDER_DIST = {
+        ULTRA = 2500,
+        HIGH = 1800,
+        MEDIUM = 1200,
+        LOW = 800,
+        POTATO = 500
+    },
+    LOD_LEVELS = 4,
+    UPDATE_INTERVAL = 0.15,
+}
+
+local mobile = UIS.TouchEnabled and not UIS.KeyboardEnabled
+local renderDist = mobile and cfg.RENDER_DIST.MEDIUM or cfg.RENDER_DIST.HIGH
+
+local objCache = {}
+local cacheSize = 0
+
+local function makeCache(model)
+    if objCache[model] then return end
+    
+    local cache = {
+        parts = {},
+        origTrans = {},
+        particles = {},
+        lights = {},
+        effects = {},
+        primary = nil,
+        lod = 1,
+    }
+    
+    local success, prim = pcall(function()
+        return model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+    end)
+    
+    if not success or not prim then return end
+    cache.primary = prim
+    
+    for _, v in ipairs(model:GetDescendants()) do
+        if v:IsA("BasePart") then
+            table.insert(cache.parts, v)
+            table.insert(cache.origTrans, v.Transparency)
+        elseif v:IsA("ParticleEmitter") then
+            table.insert(cache.particles, v)
+        elseif v.ClassName:match("Light$") then
+            table.insert(cache.lights, v)
+        elseif v:IsA("Beam") or v:IsA("Trail") then
+            table.insert(cache.effects, v)
+        end
+    end
+    
+    objCache[model] = cache
+    cacheSize = cacheSize + 1
+end
+
+local function killCache(model)
+    if objCache[model] then
+        objCache[model] = nil
+        cacheSize = math.max(0, cacheSize - 1)
+    end
+end
+
+local function setLOD(cache, distance)
+    if not cache or not cache.primary or not cache.primary.Parent then return end
+    
+    local newLOD = 1
+    if distance > renderDist then
+        newLOD = 4
+    elseif distance > renderDist * 0.7 then
+        newLOD = 3
+    elseif distance > renderDist * 0.4 then
+        newLOD = 2
+    end
+    
+    if newLOD == cache.lod then return end
+    cache.lod = newLOD
+    
+    if newLOD == 4 then
+        for i, part in ipairs(cache.parts) do
+            part.Transparency = 1
+            part.CastShadow = false
+        end
+        for _, p in ipairs(cache.particles) do p.Enabled = false end
+        for _, l in ipairs(cache.lights) do l.Enabled = false end
+        for _, e in ipairs(cache.effects) do e.Enabled = false end
+    elseif newLOD == 3 or newLOD == 2 then
+        for i, part in ipairs(cache.parts) do
+            part.Transparency = cache.origTrans[i]
+            part.CastShadow = false
+        end
+        for _, p in ipairs(cache.particles) do p.Enabled = false end
+        for _, l in ipairs(cache.lights) do l.Enabled = false end
+        for _, e in ipairs(cache.effects) do e.Enabled = false end
+    else
+        for i, part in ipairs(cache.parts) do
+            part.Transparency = cache.origTrans[i]
+            part.CastShadow = not mobile
+        end
+        for _, p in ipairs(cache.particles) do p.Enabled = true end
+        for _, l in ipairs(cache.lights) do l.Enabled = true end
+        for _, e in ipairs(cache.effects) do e.Enabled = true end
+    end
+end
+
+local perfMon = {
+    on = true,
+    fps = 60,
+    lastTick = 0,
+}
+
+function perfMon:UpdateLODs()
+    if not self.enabled then return end
+    
+    local now = os.clock()
+    if now - self.lastTick < cfg.UPDATE_INTERVAL then return end
+    self.lastTick = now
+    
+    local camera = WS.CurrentCamera
+    if not camera then return end
+    
+    local camPos = camera.CFrame.Position
+    
+    for model, cache in pairs(objCache) do
+        if model and model.Parent and cache.primary and cache.primary.Parent then
+            local distance = (cache.primary.Position - camPos).Magnitude
+            setLOD(cache, distance)
+        else
+            killCache(model)
+        end
+    end
+    
+    self.fps = 1 / math.max(0.001, RS.Heartbeat:Wait())
+    
+    if self.fps < 40 then
+        renderDist = math.max(cfg.RENDER_DIST.POTATO, renderDist * 0.9)
+        Lighting.GlobalShadows = false
+    elseif self.fps > 100 and renderDist < cfg.RENDER_DIST.HIGH then
+        renderDist = math.min(cfg.RENDER_DIST.HIGH, renderDist * 1.05)
+    end
+end
+
+CS:GetInstanceAddedSignal("PerfCull"):Connect(makeCache)
+CS:GetInstanceRemovedSignal("PerfCull"):Connect(killCache)
+for _, obj in ipairs(CS:GetTagged("PerfCull")) do makeCache(obj) end
+
+task.spawn(function()
+    while true do
+        perfMon:UpdateLODs()
+        RS.Heartbeat:Wait()
+    end
+end)
+local cbf = {
+    timeOrigin = os.clock(),
+    tickOrigin = tick(),
+    
+    pollRates = {
+        primary = 1000,
+        secondary = 500,
+        tertiary = 240,
+    },
+    
+    TPS = 480,
+    maxTPS = 1000,
+    tps = 480,
+    stepDelta = 1/480,
+    subSteps = 4,
+    
+    queues = {
+        instant = {},
+        primary = {},
+        quantum = {},
+        predictive = {},
+        echo = {},
+    },
+    
+    qSizes = {
+        instant = 0,
+        primary = 0,
+        quantum = 0,
+        predictive = 0,
+        echo = 0,
+    },
+    
+    maxQueueSize = 2048,
+    
+    physicsStepInjection = {
+        on = true,
+        injected = {},
+        stepCount = 0,
+        maxInjections = 1000,
+    },
+    
+    inputStates = {
+        mouse1 = {
+            current = false,
+            previous = false,
+            pressTime = 0,
+            releaseTime = 0,
+            holdDuration = 0,
+            velocity = 0,
+            acceleration = 0,
+            quantumStates = {},
+        }
+    },
+    
+    history = {
+        inputs = {},
+        size = 0,
+        maxSize = 1000,
+        patterns = {},
+        intervals = {},
+    },
+    
+    predictor = {
+        on = true,
+        confidence = 0,
+        patterns = {},
+        intervals = {},
+        avgInterval = 0,
+        nextPredicted = 0,
+        learningRate = 0.2,
+        accuracy = 0,
+        predictions = {},
+    },
+    
+    interpolator = {
+        on = true,
+        method = "hermite",
+        points = {},
+        maxPoints = 1000,
+    },
+    
+    extrapolator = {
+        on = true,
+        lookahead = 0.0001,
+        predictions = {},
+    },
+    
+    chaos = {
+        enabled = false,
+        intensity = 0,
+        jitter = 0,
+        boost = 1.0,
+        quantumFluctuation = false,
+        temporalNoise = false,
+    },
+    
+    echo = {
+        on = true,
+        count = 3,
+        spacing = 0.05,
+        decay = 0.9,
+    },
+    
+    temporal = {
+        enabled = false,
+        shifts = {},
+    },
+    
+    frameSync = {
+        on = true,
+        frameNumber = 0,
+        subFrame = 0,
+        microFrame = 0,
+        nanoFrame = 0,
+        picoFrame = 0,
+        lastFrameTime = 0,
+    },
+    
+    stats = {
+        total = 0,
+        processed = 0,
+        injected = 0,
+        dropped = 0,
+        
+        avgLat = 0,
+        minLat = math.huge,
+        maxLat = 0,
+        
+        perfect = 0,
+        subMicro = 0,
+        instant = 0,
+        
+        totalProcTime = 0,
+        avgProcTime = 0,
+        peakProcTime = 0,
+        
+        queueStats = {},
+    },
+    
+    callbacks = {
+        onInput = nil,
+        onPhysicsStep = nil,
+        onFrameSync = nil,
+    },
+    
+    on = true,
+    instant = true,
+    physInject = true,
+    zeroLat = true,
+}
+
+local function getPicoTime()
+    local base = (os.clock() - cbf.timeOrigin) * 1e12
+    local tick_component = (tick() - cbf.tickOrigin) * 1e12
+    local hardware_offset = (os.clock() % 0.000001) * 1e12
+    return base + (tick_component * 0.05) + hardware_offset
+end
+
+local function getNanoTime()
+    return getPicoTime() / 1000
+end
+
+local function getTime()
+    return getNanoTime() / 1000
+end
+
+local function getMilliTime()
+    return getTime() / 1000
+end
+
+local function inject(timestamp, inputType)
+    if not cbf.physicsStepInjection.enabled then return end
+    if cbf.physicsStepInjection.stepCount >= cbf.physicsStepInjection.maxInjections then return end
+    
+    local step = {
+        timestamp = timestamp,
+        inputType = inputType,
+        injectedAt = getTime(),
+        processed = false,
+    }
+    
+    table.insert(cbf.physicsStepInjection.injected, step)
+    cbf.physicsStepInjection.stepCount = cbf.physicsStepInjection.stepCount + 1
+    cbf.stats.injected = cbf.stats.injected + 1
+    
+    if cbf.callbacks.onPhysicsStep then
+        pcall(function()
+            cbf.callbacks.onPhysicsStep(step)
+        end)
+    end
+end
+
+local function queueToMultipleQueues(inputType, timestamp, priority)
+    local queues = {
+        {name = "instant", priority = 1000},
+        {name = "primary", priority = 100},
+    }
+    
+    local relativeTime = (os.clock() - (cbf.frameSync.lastFrameTime or os.clock()))
+    
+    for _, queueData in ipairs(queues) do
+        local queueName = queueData.name
+        local queue = cbf.queues[queueName]
+        
+        if cbf.qSizes[queueName] < cbf.maxQueueSize then
+            local input = {
+                type = inputType,
+                timestamp = timestamp,
+                relativeTime = relativeTime,
+                priority = priority + queueData.priority,
+                processed = false,
+                queueName = queueName,
+                frameNumber = cbf.frameSync.frameNumber,
+                subFrame = cbf.frameSync.subFrame,
+            }
+            
+            table.insert(queue, input)
+            cbf.qSizes[queueName] = cbf.qSizes[queueName] + 1
+        end
+    end
+end
+
+local function queueQuantumInput(inputType, timestamp)
+    if cbf.qSizes.quantum >= cbf.maxQueueSize then return end
+    
+    local states = {}
+    for i = 1, 5 do
+        states[i] = math.random() > 0.3
+    end
+    
+    local input = {
+        type = inputType,
+        timestamp = timestamp,
+        quantumStates = states,
+        waveFunction = math.random(),
+        collapsed = false,
+        relativeTime = (os.clock() - (cbf.frameSync.lastFrameTime or os.clock())),
+        processed = false,
+    }
+    
+    table.insert(cbf.queues.quantum, input)
+    cbf.qSizes.quantum = cbf.qSizes.quantum + 1
+end
+
+local function queueEchoInputs(baseInput)
+    for i = 1, cbf.echo.count do
+        if cbf.qSizes.echo >= cbf.maxQueueSize then break end
+        
+        local timeOffset = i * cbf.echo.spacing
+        local amplitude = cbf.echo.decay ^ i
+        
+        local echo = {
+            type = baseInput.type .. "_echo",
+            timestamp = baseInput.timestamp + timeOffset,
+            echoIndex = i,
+            amplitude = amplitude,
+            originalTimestamp = baseInput.timestamp,
+            relativeTime = baseInput.relativeTime,
+            processed = false,
+        }
+        
+        table.insert(cbf.queues.echo, echo)
+        cbf.qSizes.echo = cbf.qSizes.echo + 1
+    end
+end
+
+local function queueTemporalInputs(baseInput)
+    for _, shift in ipairs(cbf.temporal.shifts) do
+        if cbf.qSizes.temporal >= cbf.maxQueueSize then break end
+        
+        local temporal = {
+            type = baseInput.type .. "_temporal",
+            timestamp = baseInput.timestamp + shift,
+            timeShift = shift,
+            originalTimestamp = baseInput.timestamp,
+            relativeTime = baseInput.relativeTime,
+            processed = false,
+        }
+        
+        table.insert(cbf.queues.temporal, temporal)
+        cbf.qSizes.temporal = cbf.qSizes.temporal + 1
+    end
+end
+
+local function learnPattern(timestamp)
+    if not cbf.predictor.enabled then return end
+    
+    table.insert(cbf.history.inputs, timestamp)
+    cbf.history.size = cbf.history.size + 1
+    
+    if cbf.history.size > cbf.history.maxSize then
+        table.remove(cbf.history.inputs, 1)
+        cbf.history.size = cbf.history.size - 1
+    end
+    
+    if cbf.history.size >= 2 then
+        local interval = timestamp - cbf.history.inputs[cbf.history.size - 1]
+        table.insert(cbf.history.intervals, interval)
+        
+        if #cbf.history.intervals > 1000 then
+            table.remove(cbf.history.intervals, 1)
+        end
+        
+        local sum = 0
+        for _, iv in ipairs(cbf.history.intervals) do
+            sum = sum + iv
+        end
+        cbf.predictor.avgInterval = sum / #cbf.history.intervals
+        
+        cbf.predictor.confidence = math.min(1.0, #cbf.history.intervals / 100)
+    end
+end
+
+local function predictInput()
+    if not cbf.predictor.enabled or cbf.predictor.confidence < 0.3 then return nil end
+    
+    local lastTime = cbf.history.inputs[cbf.history.size]
+    if not lastTime then return nil end
+    
+    local interval = cbf.predictor.avgInterval
+    if interval <= 0 or interval > 5e6 then return nil end
+    
+    local predicted = lastTime + interval
+    local currentTime = getTime()
+    
+    if predicted > currentTime and (predicted - currentTime) < 500000 then
+        return predicted
+    end
+    
+    return nil
+end
+
+local function queuePredictiveInput(predictedTime)
+    if cbf.qSizes.predictive >= cbf.maxQueueSize then return end
+    
+    local input = {
+        type = "mouse1_predicted",
+        timestamp = predictedTime,
+        confidence = cbf.predictor.confidence,
+        predicted = true,
+        relativeTime = (os.clock() - (cbf.frameSync.lastFrameTime or os.clock())),
+        processed = false,
+    }
+    
+    table.insert(cbf.queues.predictive, input)
+    cbf.qSizes.predictive = cbf.qSizes.predictive + 1
+end
+
+local function interpolateInput(input1, input2, alpha)
+    if not cbf.interpolator.enabled then return nil end
+    
+    local timestamp = input1.timestamp + (input2.timestamp - input1.timestamp) * alpha
+    
+    local interpolated = {
+        type = "mouse1_interpolated",
+        timestamp = timestamp,
+        alpha = alpha,
+        source1 = input1.timestamp,
+        source2 = input2.timestamp,
+        relativeTime = (os.clock() - (cbf.frameSync.lastFrameTime or os.clock())),
+        processed = false,
+    }
+    
+    if cbf.qSizes.interpolated < cbf.maxQueueSize then
+        table.insert(cbf.queues.interpolated, interpolated)
+        cbf.qSizes.interpolated = cbf.qSizes.interpolated + 1
+    end
+end
+
+local function extrapolateInput(recentInputs)
+    if not cbf.extrapolator.enabled or #recentInputs < 3 then return nil end
+    
+    local dt1 = recentInputs[2].timestamp - recentInputs[1].timestamp
+    local dt2 = recentInputs[3].timestamp - recentInputs[2].timestamp
+    
+    local velocity = (dt1 + dt2) / 2
+    local acceleration = dt2 - dt1
+    
+    local extrapolatedTime = recentInputs[3].timestamp + velocity + (acceleration * 0.5)
+    
+    local extrapolated = {
+        type = "mouse1_extrapolated",
+        timestamp = extrapolatedTime,
+        velocity = velocity,
+        acceleration = acceleration,
+        relativeTime = (os.clock() - (cbf.frameSync.lastFrameTime or os.clock())),
+        processed = false,
+    }
+    
+    if cbf.qSizes.extrapolated < cbf.maxQueueSize then
+        table.insert(cbf.queues.extrapolated, extrapolated)
+        cbf.qSizes.extrapolated = cbf.qSizes.extrapolated + 1
+    end
+end
+
+local function capture(inputType, sourcePriority)
+    if not cbf.on then return end
+    
+    local timestamp = getTime()
+    
+    cbf.stats.total = cbf.stats.total + 1
+    
+    learnPattern(timestamp)
+    
+    queueToMultipleQueues(inputType, timestamp, sourcePriority)
+    
+    if cbf.instant then
+        inject(timestamp, inputType)
+    end
+    
+    queueQuantumInput(inputType, timestamp)
+    
+    local baseInput = {
+        type = inputType,
+        timestamp = timestamp,
+        relativeTime = (os.clock() - (cbf.frameSync.lastFrameTime or os.clock()))
+    }
+    
+    queueEchoInputs(baseInput)
+    
+    if cbf.temporal.enabled then
+        queueTemporalInputs(baseInput)
+    end
+    
+    if cbf.chaos.enabled then
+        for chaos_iteration = 1, math.floor(cbf.chaos.intensity * 10) do
+            local jitterTime = timestamp + (math.random() - 0.5) * cbf.chaos.jitter * 1e6
+            queueToMultipleQueues(inputType .. "_chaos", jitterTime, sourcePriority * cbf.chaos.boost)
+        end
+    end
+end
+
+local function procQueue(queue, queueName, stepTime)
+    local processed = 0
+    local processingStart = getTime()
+    
+    for i = #queue, 1, -1 do
+        local input = queue[i]
+        
+        if not input.processed and input.relativeTime <= stepTime then
+            input.processed = true
+            
+            if cbf.callbacks.onInput then
+                pcall(function()
+                    cbf.callbacks.onInput(input.type, input.timestamp, queueName)
+                end)
+            end
+            
+            local latency = getTime() - input.timestamp
+            
+            cbf.stats.avgLat = (cbf.stats.avgLat * cbf.stats.processed + latency) / (cbf.stats.processed + 1)
+            cbf.stats.minLat = math.min(cbf.stats.minLat, latency)
+            cbf.stats.maxLat = math.max(cbf.stats.maxLat, latency)
+            
+            if latency < 0.001 then
+                cbf.stats.subMicro = cbf.stats.subMicro + 1
+            end
+            
+            if latency < 1 then
+                cbf.stats.perfect = cbf.stats.perfect + 1
+            end
+            
+            if queueName == "instant" then
+                cbf.stats.instant = cbf.stats.instant + 1
+            end
+            
+            cbf.stats.processed = cbf.stats.processed + 1
+            processed = processed + 1
+            
+            table.remove(queue, i)
+        end
+    end
+    
+    local processingTime = getTime() - processingStart
+    cbf.stats.totalProcTime = cbf.stats.totalProcTime + processingTime
+    cbf.stats.avgProcTime = cbf.stats.totalProcTime / math.max(1, cbf.stats.processed)
+    cbf.stats.peakProcTime = math.max(cbf.stats.peakProcTime, processingTime)
+    
+    return processed
+end
+
+local function procInjected(stepTime)
+    for i = #cbf.physicsStepInjection.injected, 1, -1 do
+        local step = cbf.physicsStepInjection.injected[i]
+        
+        if not step.processed and step.timestamp <= (getTime()) then
+            step.processed = true
+            
+            if cbf.callbacks.onInput then
+                pcall(function()
+                    cbf.callbacks.onInput(step.inputType, step.timestamp, "physics_injected")
+                end)
+            end
+            
+            table.remove(cbf.physicsStepInjection.injected, i)
+            cbf.physicsStepInjection.stepCount = cbf.physicsStepInjection.stepCount - 1
+        end
+    end
+end
+
+UIS.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        cbf.inputStates.mouse1.current = true
+        cbf.inputStates.mouse1.pressTime = getTime()
+        capture("mouse1_uis_began", 1000)
+    elseif input.UserInputType == Enum.UserInputType.Touch then
+        capture("mouse1_touch", 1000)
+    end
+end)
+
+UIS.InputEnded:Connect(function(input, gameProcessed)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        cbf.inputStates.mouse1.current = false
+        cbf.inputStates.mouse1.releaseTime = getTime()
+        cbf.inputStates.mouse1.holdDuration = cbf.inputStates.mouse1.releaseTime - cbf.inputStates.mouse1.pressTime
+        capture("mouse1_uis_ended", 900)
+    end
+end)
+
+UIS.InputChanged:Connect(function(input, gameProcessed)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        capture("mouse1_uis_changed", 800)
+    end
+end)
+
+m.Button1Down:Connect(function()
+    capture("mouse1_legacy_down", 950)
+end)
+
+m.Button1Up:Connect(function()
+    capture("mouse1_legacy_up", 900)
+end)
+
+ContextActionService:BindAction("CBF_Mouse1", function(actionName, inputState, inputObject)
+    if inputState == Enum.UserInputState.Begin then
+        capture("mouse1_context_begin", 900)
+    elseif inputState == Enum.UserInputState.End then
+        capture("mouse1_context_end", 850)
+    elseif inputState == Enum.UserInputState.Change then
+        capture("mouse1_context_change", 800)
+    end
+end, false, Enum.UserInputType.MouseButton1, Enum.UserInputType.Touch)
+
+for pollLevel = 1, 3 do
+    task.spawn(function()
+        local rate = cbf.pollRates.primary / (2 ^ (pollLevel - 1))
+        
+        while true do
+            if cbf.on then
+                local mouseState = UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+                if mouseState and not cbf.inputStates.mouse1.previous then
+                    capture("mouse1_poll_" .. tostring(math.floor(rate)), 700 - (pollLevel * 50))
+                end
+                cbf.inputStates.mouse1.previous = mouseState
+            end
+            
+            task.wait(1 / rate)
+        end
+    end)
+end
+
+task.spawn(function()
+    while true do
+        task.wait(1 / 60)
+        
+        if cbf.on and cbf.predictor.enabled then
+            local predicted = predictInput()
+            if predicted then
+                queuePredictiveInput(predicted)
+            end
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        RS.RenderStepped:Wait()
+        
+        if not cbf.on then continue end
+        
+        cbf.frameSync.lastFrameTime = os.clock()
+        cbf.frameSync.frameNumber = cbf.frameSync.frameNumber + 1
+        cbf.frameSync.subFrame = 0
+        
+        if cbf.callbacks.onFrameSync then
+            pcall(function()
+                cbf.callbacks.onFrameSync(cbf.frameSync.frameNumber)
+            end)
+        end
+    end
+end)
+
+RS.RenderStepped:Connect(function(deltaTime)
+    if not cbf.on then return end
+    
+    local steps = math.max(1, math.floor(deltaTime * cbf.tps))
+    
+    for step = 1, steps do
+        cbf.frameSync.subFrame = step
+        
+        local stepTime = (step / steps) * deltaTime
+        
+        for microStep = 1, cbf.subSteps do
+            cbf.frameSync.microFrame = microStep
+            
+            local microTime = stepTime + ((microStep / cbf.subSteps) * (deltaTime / steps))
+            
+            procQueue(cbf.queues.instant, "instant", microTime)
+            procQueue(cbf.queues.primary, "primary", microTime)
+            procQueue(cbf.queues.quantum, "quantum", microTime)
+            procQueue(cbf.queues.predictive, "predictive", microTime)
+            procQueue(cbf.queues.echo, "echo", microTime)
+            
+            procInjected(microTime)
+        end
+    end
+end)
+
+RS.Heartbeat:Connect(function(deltaTime)
+    if not cbf.on then return end
+    
+    for queueName, queue in pairs(cbf.queues) do
+        cbf.qSizes[queueName] = #queue
+    end
+    
+    local currentTime = getTime()
+    local cutoff = currentTime - 10000000
+    
+    for queueName, queue in pairs(cbf.queues) do
+        for i = #queue, 1, -1 do
+            if queue[i].timestamp < cutoff then
+                table.remove(queue, i)
+            end
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(30)
+        
+        if cbf.stats.total > 0 then
+            local processRate = (cbf.stats.processed / cbf.stats.total) * 100
+            local dropRate = (cbf.stats.dropped / cbf.stats.total) * 100
+            
+            local totalQueued = 0
+            for _, size in pairs(cbf.qSizes) do
+                totalQueued = totalQueued + size
+            end
+            
+            warn(string.format(
+                "[GeoForge v10.00] Total=%d | Processed=%d (%.1f%%) | Queued=%d | Latency: Avg=%.3fμs Min=%.3fμs Max=%.3fμs | Perfect=%d | SubMicro=%d | Instant=%d | Injected=%d | TPS=%d",
+                cbf.stats.total,
+                cbf.stats.processed,
+                processRate,
+                totalQueued,
+                cbf.stats.avgLat,
+                cbf.stats.minLat,
+                cbf.stats.maxLat,
+                cbf.stats.perfect,
+                cbf.stats.subMicro,
+                cbf.stats.instant,
+                cbf.stats.injected,
+                cbf.tps
+            ))
+        end
+    end
+end)
+
+_G.GeoForge = {
+    Version = "v10.00",
+    
+    CBF = {
+        GetStats = function()
+            return {
+                total = cbf.stats.total,
+                processed = cbf.stats.processed,
+                dropped = cbf.stats.dropped,
+                injected = cbf.stats.injected,
+                
+                latency = {
+                    avg = cbf.stats.avgLat,
+                    min = cbf.stats.minLat,
+                    max = cbf.stats.maxLat,
+                },
+                
+                precision = {
+                    perfect = cbf.stats.perfect,
+                    subMicrosecond = cbf.stats.subMicro,
+                    instant = cbf.stats.instant,
+                },
+                
+                processing = {
+                    avg = cbf.stats.avgProcTime,
+                    peak = cbf.stats.peakProcTime,
+                },
+                
+                queues = cbf.qSizes,
+                
+                system = {
+                    tps = cbf.tps,
+                    pollingRate = cbf.pollRates.primary,
+                    subSteps = cbf.subSteps,
+                },
+                
+                predictor = {
+                    confidence = cbf.predictor.confidence,
+                    avgInterval = cbf.predictor.avgInterval,
+                },
+            }
+        end,
+        
+        SetTPS = function(tps)
+            cbf.tps = math.clamp(tps, 1000, cbf.maxTPS)
+            cbf.stepDelta = 1 / cbf.tps
+        end,
+        
+        SetPollingRate = function(rate)
+            cbf.pollRates.primary = math.clamp(rate, 1000, 1000000)
+        end,
+        
+        SetInstantMode = function(enabled)
+            cbf.instant = enabled
+        end,
+        
+        SetPhysicsInjection = function(enabled)
+            cbf.physInject = enabled
+        end,
+        
+        SetZeroLatency = function(enabled)
+            cbf.zeroLat = enabled
+        end,
+        
+        RegisterCallback = function(callback)
+            cbf.callbacks.onInput = callback
+        end,
+        
+        RegisterPhysicsCallback = function(callback)
+            cbf.callbacks.onPhysicsStep = callback
+        end,
+        
+        ResetStats = function()
+            cbf.stats = {
+                total = 0,
+                processed = 0,
+                injected = 0,
+                dropped = 0,
+                avgLat = 0,
+                minLat = math.huge,
+                maxLat = 0,
+                perfect = 0,
+                subMicro = 0,
+                instant = 0,
+                totalProcTime = 0,
+                avgProcTime = 0,
+                peakProcTime = 0,
+            }
+        end,
+    },
+    
+    Performance = {
+        GetFPS = function() return math.floor(perfMon.fps) end,
+        GetRenderDistance = function() return math.floor(renderDist) end,
+        SetRenderDistance = function(dist)
+            renderDist = math.clamp(dist, cfg.RENDER_DIST.POTATO, cfg.RENDER_DIST.ULTRA)
+        end,
+    },
+}
+
+warn("[GeoForge v10.00] Click Between Frames system loaded")
+warn("[cbf] Polling: 1kHz | TPS: " .. cbf.tps .. " | Sub-steps: " .. cbf.subSteps)
+warn("[cbf] Physics injection: " .. tostring(cbf.physInject))
+warn("[cbf] Zero latency mode: " .. tostring(cbf.zeroLat))
+warn("[cbf] Based on Click Between Frames mod by Syzzi")
